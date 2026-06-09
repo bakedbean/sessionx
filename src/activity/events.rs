@@ -57,6 +57,12 @@ use crate::error::Result;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
+// The ISO-8601 parser is shared with the change-extraction path; keep a single
+// implementation in `extract` and re-export it here so the long-standing
+// `activity::events::parse_iso8601_ms` path (used by the Codex/Pi tailers and
+// `parse_timestamp` below) keeps resolving.
+pub use crate::extract::parse_iso8601_ms;
+
 const MAX_LOG: usize = 50;
 pub const MAX_DISPLAY_CHARS: usize = 512;
 
@@ -813,52 +819,6 @@ fn parse_timestamp(v: Option<&serde_json::Value>) -> i64 {
     parse_iso8601_ms(s).unwrap_or_else(now_ms)
 }
 
-/// Minimal ISO 8601 parser for the format Claude Code emits:
-/// `YYYY-MM-DDTHH:MM:SS.fffZ` (always UTC, always millisecond precision).
-pub fn parse_iso8601_ms(s: &str) -> Option<i64> {
-    // Strip trailing Z; we treat the timestamp as UTC.
-    let s = s.strip_suffix('Z').unwrap_or(s);
-    // Split date and time at 'T'.
-    let (date, time) = s.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let y: i32 = date_parts.next()?.parse().ok()?;
-    let mo: u32 = date_parts.next()?.parse().ok()?;
-    let d: u32 = date_parts.next()?.parse().ok()?;
-
-    let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, frac),
-        None => (time, "0"),
-    };
-    let mut tp = hms.split(':');
-    let h: u32 = tp.next()?.parse().ok()?;
-    let mi: u32 = tp.next()?.parse().ok()?;
-    let se: u32 = tp.next()?.parse().ok()?;
-    // Treat fractional seconds as milliseconds (truncate/pad to 3 digits).
-    let mut frac_ms_str = String::new();
-    for c in frac.chars().take(3) {
-        frac_ms_str.push(c);
-    }
-    while frac_ms_str.len() < 3 {
-        frac_ms_str.push('0');
-    }
-    let ms: i64 = frac_ms_str.parse().ok()?;
-
-    let days = days_from_civil(y, mo, d);
-    let secs_of_day = h as i64 * 3600 + mi as i64 * 60 + se as i64;
-    Some(days * 86_400_000 + secs_of_day * 1000 + ms)
-}
-
-/// Howard Hinnant's `days_from_civil` algorithm — days since 1970-01-01 for a
-/// proleptic Gregorian calendar date. Avoids pulling in chrono just for this.
-fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32; // [0, 399]
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era as i64 * 146_097 + doe as i64 - 719_468
-}
-
 pub fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
@@ -1235,16 +1195,6 @@ mod tests {
         assert_eq!(update.tool_use_starts[0].0, "a1");
         assert_eq!(update.tool_use_starts[0].1, "Bash");
         assert_eq!(update.tool_use_resolves, vec!["a1".to_string()]);
-    }
-
-    #[test]
-    fn iso8601_parser_roundtrips_known_value() {
-        // 2026-05-14T17:32:02.744Z. Compute the same way: days_from_civil
-        // for 2026-05-14 plus the time components.
-        let ms = parse_iso8601_ms("2026-05-14T17:32:02.744Z").unwrap();
-        let days = days_from_civil(2026, 5, 14);
-        let expected = days * 86_400_000 + (17 * 3600 + 32 * 60 + 2) * 1000 + 744;
-        assert_eq!(ms, expected);
     }
 
     #[test]
