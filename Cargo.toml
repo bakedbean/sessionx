@@ -1,0 +1,25 @@
+[package]
+name = "sessionx"
+version = "0.1.0"
+edition = "2024"
+# Edition 2024 was stabilized in 1.85, so that is the hard MSRV floor.
+rust-version = "1.85"
+authors = ["Eben Goodman"]
+description = "Parse agent session logs (Claude Code, Codex, Pi) into a change timeline and a live event stream."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/bakedbean/sessionx"
+keywords = ["claude", "agent", "session", "jsonl", "timeline"]
+categories = ["parser-implementations", "development-tools"]
+# Not ready for crates.io yet; an accidental `cargo publish` should fail fast.
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+log = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
