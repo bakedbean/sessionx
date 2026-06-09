@@ -7,9 +7,11 @@
 //!
 //! - **Change timeline** ([`Timeline`], [`ChangeEvent`]): what files an agent
 //!   changed and when, with syntax-tokenized diffs ([`syntax`]).
-//! - **Event stream** (`activity::events`): the agent's live session state —
-//!   user/assistant turns, tool calls, stop reasons.
+//! - **Event stream** ([`activity::events`]): the agent's live session state —
+//!   user/assistant turns, tool calls, stop reasons ([`StopReason`],
+//!   [`EventSnapshot`], [`WorkspaceEvents`]).
 
+pub mod activity;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -17,6 +19,10 @@ pub mod extract;
 pub mod nav;
 pub mod syntax;
 pub mod timeline;
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod test_support;
 
 // --- Change-timeline model ---
 pub use config::{ChronologyConfig, ChronologyOverride, ConfigSource, Side, WidthSpec};
@@ -26,5 +32,11 @@ pub use extract::DETAIL_MAX_CHARS;
 pub use nav::{NavAction, NavKey};
 pub use syntax::{DiffLine, DiffMarker, LangSpec, Token, TokenKind, lang_for_path};
 pub use timeline::Timeline;
+
+// --- Session event stream (shared types; per-agent tailers live in `activity`) ---
+pub use activity::events::{
+    EventKind, EventSnapshot, StopReason, TailUpdate, ToolUseCounts, WorkspaceEvents, clean_recap,
+    push_event,
+};
 
 pub use error::{Error, Result};
