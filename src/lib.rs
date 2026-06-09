@@ -30,7 +30,10 @@ pub use config::{resolve, resolve_global_only};
 pub use event::{ChangeDetail, ChangeEvent, ChangeSource, ChangeTool};
 pub use extract::DETAIL_MAX_CHARS;
 pub use nav::{NavAction, NavKey};
-pub use syntax::{DiffLine, DiffMarker, LangSpec, Token, TokenKind, lang_for_path};
+pub use syntax::{
+    CellKind, DiffCell, DiffLine, DiffMarker, LangSpec, SideRow, Token, TokenKind,
+    change_detail_side_by_side, lang_for_path,
+};
 pub use timeline::Timeline;
 
 // --- Session event stream (shared types; per-agent tailers live in `activity`) ---

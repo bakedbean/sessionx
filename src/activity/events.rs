@@ -58,7 +58,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 const MAX_LOG: usize = 50;
-pub(crate) const MAX_DISPLAY_CHARS: usize = 512;
+pub const MAX_DISPLAY_CHARS: usize = 512;
 
 /// Why the assistant's most recent message stopped. Mirrors the Anthropic
 /// API's `stop_reason` field. `EndTurn`, `MaxTokens`, and `StopSequence` all
@@ -859,7 +859,7 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     era as i64 * 146_097 + doe as i64 - 719_468
 }
 
-pub(crate) fn collapse_ws(s: &str) -> String {
+pub fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for c in s.chars() {
@@ -876,7 +876,7 @@ pub(crate) fn collapse_ws(s: &str) -> String {
     out.trim().to_string()
 }
 
-pub(crate) fn truncate_display(s: &str, max: usize) -> String {
+pub fn truncate_display(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
