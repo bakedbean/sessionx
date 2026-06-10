@@ -15,7 +15,7 @@ parse their respective formats on top of the shared event types.
 
 `sessionx` has **no UI dependency** — rendering lives in the consumers. It is
 the shared core behind [`wsx`](https://github.com/bakedbean/workspacex) and
-[`chronox-tui`](https://github.com/bakedbean/chronox-tui).
+[`chronox`](https://github.com/bakedbean/chronox).
 
 ## Layout
 
