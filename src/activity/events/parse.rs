@@ -43,6 +43,15 @@ pub struct ParsedLine {
     /// tool_use blocks on this line, in source order. Empty for any
     /// other tool / non-assistant line.
     pub edited_file_paths: Vec<String>,
+    /// Sum of `input_tokens + cache_creation_input_tokens +
+    /// cache_read_input_tokens` from this assistant message's `usage`.
+    /// Approximates the current context-window fill (the latest message's
+    /// value is the live size). None for non-assistant lines or lines
+    /// without a usage block.
+    pub context_tokens: Option<u64>,
+    /// `message.model` from this assistant line, used downstream to map
+    /// to a context-window size. None when absent.
+    pub model_id: Option<String>,
 }
 
 /// Parse a single JSONL line into a [`ParsedLine`]. Malformed lines and
@@ -147,6 +156,21 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
         .and_then(|s| s.as_str())
     {
         out.stop_reason = Some(StopReason::from_json_str(sr));
+    }
+    if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+        let field = |k: &str| usage.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        out.context_tokens = Some(
+            field("input_tokens")
+                + field("cache_creation_input_tokens")
+                + field("cache_read_input_tokens"),
+        );
+    }
+    if let Some(model) = v
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(|s| s.as_str())
+    {
+        out.model_id = Some(model.to_string());
     }
     let Some(blocks) = v
         .get("message")

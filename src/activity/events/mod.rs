@@ -1707,6 +1707,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_captures_context_tokens_and_model() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"model":"claude-opus-4-8","stop_reason":"end_turn","usage":{"input_tokens":2,"cache_creation_input_tokens":4874,"cache_read_input_tokens":72081,"output_tokens":277},"content":[{"type":"text","text":"hi"}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        // context = input + cache_creation + cache_read = 2 + 4874 + 72081
+        assert_eq!(parsed.context_tokens, Some(76_957));
+        assert_eq!(parsed.model_id.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
     fn clean_recap_real_hibiscus_turn_2() {
         // Regression: insight banner + bullets + closing banner + prose.
         let s = "`★ Insight ─────`\n- DetailContext is a borrowed snapshot — zero allocations per draw.\n- The four current modules each tap a different layer.\n`─────`\n\nHere are ideas grouped by layer.";
