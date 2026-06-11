@@ -202,6 +202,23 @@ pub struct WorkspaceEvents {
     /// the SESSION SUMMARY column has stable text to render between
     /// turns. Cleared on session reset.
     pub last_completed_turn_text: Option<String>,
+    /// Latest assistant message's context-window fill (input + cache
+    /// creation + cache read). Drives the detail bar's context line.
+    /// Cleared on session reset.
+    pub context_tokens: Option<u64>,
+    /// Latest assistant message's model id, for context-window sizing.
+    /// Cleared on session reset.
+    pub model_id: Option<String>,
+    /// Render-ready label for the agent's most recent tool action
+    /// (Bash command or `now <basename>`). Drives the row's live edge
+    /// in Thinking/Waiting. Cleared on session reset.
+    pub current_action: Option<String>,
+    /// Topic of the pending `AskUserQuestion`, if one is in flight.
+    /// Drives the row's `asking: <topic>` in the Question state.
+    /// sessionx clears this only on session reset; it does not track question
+    /// resolution. The wsx merge layer additionally clears it once no question
+    /// tool is pending (via `pending_tool_uses`/`pending_question_tool()`).
+    pub pending_question_text: Option<String>,
 }
 
 impl Default for WorkspaceEvents {
@@ -222,6 +239,10 @@ impl Default for WorkspaceEvents {
             recent_edited_files: VecDeque::with_capacity(7),
             longest_text_this_turn: None,
             last_completed_turn_text: None,
+            context_tokens: None,
+            model_id: None,
+            current_action: None,
+            pending_question_text: None,
         }
     }
 }
@@ -253,6 +274,10 @@ impl WorkspaceEvents {
         self.recent_edited_files.clear();
         self.longest_text_this_turn = None;
         self.last_completed_turn_text = None;
+        self.context_tokens = None;
+        self.model_id = None;
+        self.current_action = None;
+        self.pending_question_text = None;
     }
 
     /// Merge a batch's longest assistant text into the per-turn
@@ -414,6 +439,15 @@ pub struct TailUpdate {
     /// `WorkspaceEvents.recent_edited_files`, deduping consecutive
     /// same-path entries and bounding to 7.
     pub edited_file_paths: Vec<String>,
+    /// Context-window fill from the LAST assistant message in this batch
+    /// (later messages overwrite earlier ones). None when no usage seen.
+    pub context_tokens: Option<u64>,
+    /// Model id from the last assistant message in this batch.
+    pub model_id: Option<String>,
+    /// Render-ready label for the most recent tool action in this batch.
+    pub current_action: Option<String>,
+    /// AskUserQuestion topic from the last such tool_use in this batch.
+    pub pending_question_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +549,20 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
         }
         if let Some(text) = parsed.last_assistant_text {
             update.last_assistant_text = Some(text);
+        }
+        if let Some(t) = parsed.context_tokens {
+            update.context_tokens = Some(t);
+        }
+        if let Some(m) = parsed.model_id {
+            update.model_id = Some(m);
+        }
+        if let Some(a) = parsed.current_action {
+            update.current_action = Some(a);
+        }
+        // Last-wins is fine: only one AskUserQuestion can be outstanding at
+        // a time, so a batch realistically carries at most one.
+        if let Some(q) = parsed.pending_question_text {
+            update.pending_question_text = Some(q);
         }
     }
     update.new_offset = consumed;
@@ -1398,6 +1446,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_surfaces_notebook_edit_path() {
+        // NotebookEdit carries its path in `notebook_path`, not `file_path`;
+        // it is a mutating tool and must appear in RECENT FILES.
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"NotebookEdit","input":{"notebook_path":"/abs/notes/analysis.ipynb"}}]},"timestamp":"2026-05-14T17:32:14.000Z"}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.edited_file_paths,
+            vec!["/abs/notes/analysis.ipynb".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_assistant_skips_read_paths() {
         // Read never modifies the worktree — its file_path should not
         // be captured as a recent edit (otherwise the dashboard detail
@@ -1707,6 +1767,80 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_captures_context_tokens_and_model() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"model":"claude-opus-4-8","stop_reason":"end_turn","usage":{"input_tokens":2,"cache_creation_input_tokens":4874,"cache_read_input_tokens":72081,"output_tokens":277},"content":[{"type":"text","text":"hi"}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        // context = input + cache_creation + cache_read = 2 + 4874 + 72081
+        assert_eq!(parsed.context_tokens, Some(76_957));
+        assert_eq!(parsed.model_id.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn parse_assistant_current_action_is_bash_command() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test --lib"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("cargo test --lib"));
+    }
+
+    #[test]
+    fn parse_assistant_current_action_is_now_basename_for_edit() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/abs/src/ui/dashboard/column_content.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.current_action.as_deref(),
+            Some("now column_content.rs")
+        );
+    }
+
+    #[test]
+    fn parse_assistant_no_current_action_for_read() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/abs/x.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action, None);
+    }
+
+    #[test]
+    fn parse_assistant_captures_ask_user_question_header() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"header":"Auth method","question":"Which auth approach?"}]}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.pending_question_text.as_deref(), Some("Auth method"));
+    }
+
+    #[test]
+    fn parse_assistant_ask_user_question_falls_back_to_question() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Which auth approach?"}]}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.pending_question_text.as_deref(),
+            Some("Which auth approach?")
+        );
+    }
+
+    #[test]
+    fn parse_assistant_current_action_for_notebook_edit_uses_notebook_path() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"NotebookEdit","input":{"notebook_path":"/abs/notes/analysis.ipynb"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("now analysis.ipynb"));
+    }
+
+    #[test]
+    fn parse_assistant_current_action_for_write_uses_file_path() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"/abs/src/new_mod.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("now new_mod.rs"));
+    }
+
+    #[test]
+    fn parse_assistant_current_action_uses_last_action_not_last_tool() {
+        // A message with an action tool (Bash) followed by a read-only tool
+        // (Read) must still surface the Bash command — the live-edge label
+        // tracks the last *action*, not the last tool_use overall.
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/abs/x.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
     fn clean_recap_real_hibiscus_turn_2() {
         // Regression: insight banner + bullets + closing banner + prose.
         let s = "`★ Insight ─────`\n- DetailContext is a borrowed snapshot — zero allocations per draw.\n- The four current modules each tap a different layer.\n`─────`\n\nHere are ideas grouped by layer.";
@@ -1715,5 +1849,39 @@ mod tests {
             got.starts_with("Here are ideas grouped by layer."),
             "expected post-banner prose, got: {got:?}"
         );
+    }
+
+    #[test]
+    fn tail_session_takes_latest_context_tokens_and_question_topic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let l1 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":9},"content":[{"type":"tool_use","id":"t0","name":"Bash","input":{"command":"cargo build"}}]}}"#;
+        let l2 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:01.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":98},"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"header":"Auth method"}]}}]}}"#;
+        std::fs::write(&path, format!("{l1}\n{l2}\n")).unwrap();
+
+        let update = tail_session(&path, 0).unwrap();
+        // latest assistant line wins for context tokens (2 + 98 = 100)
+        assert_eq!(update.context_tokens, Some(100));
+        assert_eq!(update.model_id.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(update.pending_question_text.as_deref(), Some("Auth method"));
+        // l1 set current_action; l2 (AskUserQuestion) leaves it None, so the
+        // l1 value must survive (None never overwrites a prior Some).
+        assert_eq!(update.current_action.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
+    fn reset_clears_new_activity_fields() {
+        let mut e = WorkspaceEvents {
+            context_tokens: Some(123),
+            model_id: Some("claude-opus-4-8".to_string()),
+            current_action: Some("now x.rs".to_string()),
+            pending_question_text: Some("Auth method".to_string()),
+            ..WorkspaceEvents::default()
+        };
+        e.reset_session_state();
+        assert_eq!(e.context_tokens, None);
+        assert_eq!(e.model_id, None);
+        assert_eq!(e.current_action, None);
+        assert_eq!(e.pending_question_text, None);
     }
 }

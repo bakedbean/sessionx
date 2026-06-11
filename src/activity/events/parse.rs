@@ -43,6 +43,23 @@ pub struct ParsedLine {
     /// tool_use blocks on this line, in source order. Empty for any
     /// other tool / non-assistant line.
     pub edited_file_paths: Vec<String>,
+    /// Sum of `input_tokens + cache_creation_input_tokens +
+    /// cache_read_input_tokens` from this assistant message's `usage`.
+    /// Approximates the current context-window fill (the latest message's
+    /// value is the live size). None for non-assistant lines or lines
+    /// without a usage block.
+    pub context_tokens: Option<u64>,
+    /// `message.model` from this assistant line, used downstream to map
+    /// to a context-window size. None when absent.
+    pub model_id: Option<String>,
+    /// A clean, render-ready label for the tool action on this line:
+    /// the Bash command, or `now <basename>` for a file mutation. None
+    /// for read-only / non-action tools and non-assistant lines.
+    pub current_action: Option<String>,
+    /// The question topic for an `AskUserQuestion` tool_use on this line
+    /// (`questions[0].header`, falling back to `questions[0].question`).
+    /// None when no such tool is present.
+    pub pending_question_text: Option<String>,
 }
 
 /// Parse a single JSONL line into a [`ParsedLine`]. Malformed lines and
@@ -136,6 +153,15 @@ fn format_agent_dispatch(subtypes: &[&str]) -> String {
     }
 }
 
+/// Last path component of `p`, as an owned `String`. Falls back to the
+/// whole string when there is no file component.
+fn file_basename(p: &str) -> String {
+    std::path::Path::new(p)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string())
+}
+
 fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
     let mut out = ParsedLine::default();
     // stop_reason lives at message.stop_reason. Some lines (e.g. partial
@@ -147,6 +173,21 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
         .and_then(|s| s.as_str())
     {
         out.stop_reason = Some(StopReason::from_json_str(sr));
+    }
+    if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+        let field = |k: &str| usage.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        out.context_tokens = Some(
+            field("input_tokens")
+                + field("cache_creation_input_tokens")
+                + field("cache_read_input_tokens"),
+        );
+    }
+    if let Some(model) = v
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(|s| s.as_str())
+    {
+        out.model_id = Some(model.to_string());
     }
     let Some(blocks) = v
         .get("message")
@@ -160,6 +201,11 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
     let mut last_text: Option<&str> = None;
     let mut longest_text: Option<&str> = None;
     let mut last_tool: Option<(&str, &serde_json::Value)> = None;
+    // The last tool_use that is itself an *action* (Bash or a file mutation),
+    // used for `current_action`. Distinct from `last_tool`: a message that
+    // ends on a read-only tool (e.g. Bash then Read) should still surface the
+    // Bash command as the live edge rather than dropping the label.
+    let mut last_action_tool: Option<(&str, &serde_json::Value)> = None;
     // Subagent dispatches (the `Agent` tool) — collected across the whole
     // message so parallel dispatches can be counted and summarized by type.
     let mut agent_subtypes: Vec<&str> = Vec::new();
@@ -184,6 +230,12 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let input = block.get("input").unwrap_or(&serde_json::Value::Null);
                 last_tool = Some((name, input));
+                if matches!(
+                    name,
+                    "Bash" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit"
+                ) {
+                    last_action_tool = Some((name, input));
+                }
                 if name == "Agent" {
                     agent_subtypes.push(
                         input
@@ -191,6 +243,18 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                             .and_then(|s| s.as_str())
                             .unwrap_or(""),
                     );
+                }
+                if name == "AskUserQuestion" {
+                    out.pending_question_text = input
+                        .get("questions")
+                        .and_then(|q| q.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|q0| {
+                            q0.get("header")
+                                .and_then(|h| h.as_str())
+                                .or_else(|| q0.get("question").and_then(|q| q.as_str()))
+                        })
+                        .map(collapse_ws);
                 }
                 // Track every tool_use we see — multiple in one message is rare
                 // but possible. The id is required for matching tool_results.
@@ -204,7 +268,10 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                 // RECENT FILES list (they'd render without a diff count
                 // and confuse the user).
                 if matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit")
-                    && let Some(p) = input.get("file_path").and_then(|p| p.as_str())
+                    && let Some(p) = input
+                        .get("file_path")
+                        .or_else(|| input.get("notebook_path"))
+                        .and_then(|p| p.as_str())
                 {
                     out.edited_file_paths.push(p.to_string());
                 }
@@ -220,6 +287,21 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
     }
     if let Some(t) = longest_text {
         out.longest_text_in_message = Some(t.to_string());
+    }
+    if let Some((name, input)) = last_action_tool {
+        out.current_action = match name {
+            "Bash" => input
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(collapse_ws),
+            // `last_action_tool` only ever holds Bash or a file mutation, so
+            // this arm covers Edit/MultiEdit/Write/NotebookEdit.
+            _ => input
+                .get("file_path")
+                .or_else(|| input.get("notebook_path"))
+                .and_then(|p| p.as_str())
+                .map(|p| format!("now {}", file_basename(p))),
+        };
     }
     if let Some((name, input)) = last_tool {
         let body = if name == "Bash" {
