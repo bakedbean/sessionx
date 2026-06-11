@@ -414,6 +414,15 @@ pub struct TailUpdate {
     /// `WorkspaceEvents.recent_edited_files`, deduping consecutive
     /// same-path entries and bounding to 7.
     pub edited_file_paths: Vec<String>,
+    /// Context-window fill from the LAST assistant message in this batch
+    /// (later messages overwrite earlier ones). None when no usage seen.
+    pub context_tokens: Option<u64>,
+    /// Model id from the last assistant message in this batch.
+    pub model_id: Option<String>,
+    /// Render-ready label for the most recent tool action in this batch.
+    pub current_action: Option<String>,
+    /// AskUserQuestion topic from the last such tool_use in this batch.
+    pub pending_question_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +524,18 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
         }
         if let Some(text) = parsed.last_assistant_text {
             update.last_assistant_text = Some(text);
+        }
+        if let Some(t) = parsed.context_tokens {
+            update.context_tokens = Some(t);
+        }
+        if let Some(m) = parsed.model_id {
+            update.model_id = Some(m);
+        }
+        if let Some(a) = parsed.current_action {
+            update.current_action = Some(a);
+        }
+        if let Some(q) = parsed.pending_question_text {
+            update.pending_question_text = Some(q);
         }
     }
     update.new_offset = consumed;
@@ -1779,5 +1800,21 @@ mod tests {
             got.starts_with("Here are ideas grouped by layer."),
             "expected post-banner prose, got: {got:?}"
         );
+    }
+
+    #[test]
+    fn tail_session_takes_latest_context_tokens_and_question_topic() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("sessionx_tail_latest_ctx.jsonl");
+        let l1 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":9},"content":[{"type":"text","text":"a"}]}}"#;
+        let l2 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:01.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":98},"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"header":"Auth method"}]}}]}}"#;
+        std::fs::write(&path, format!("{l1}\n{l2}\n")).unwrap();
+
+        let update = tail_session(&path, 0).unwrap();
+        // latest assistant line wins for context tokens (2 + 98 = 100)
+        assert_eq!(update.context_tokens, Some(100));
+        assert_eq!(update.model_id.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(update.pending_question_text.as_deref(), Some("Auth method"));
+        let _ = std::fs::remove_file(&path);
     }
 }
