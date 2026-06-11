@@ -215,7 +215,9 @@ pub struct WorkspaceEvents {
     pub current_action: Option<String>,
     /// Topic of the pending `AskUserQuestion`, if one is in flight.
     /// Drives the row's `asking: <topic>` in the Question state.
-    /// Cleared on session reset and when no question tool is pending.
+    /// sessionx clears this only on session reset; it does not track question
+    /// resolution. The wsx merge layer additionally clears it once no question
+    /// tool is pending (via `pending_tool_uses`/`pending_question_tool()`).
     pub pending_question_text: Option<String>,
 }
 
@@ -1444,6 +1446,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_surfaces_notebook_edit_path() {
+        // NotebookEdit carries its path in `notebook_path`, not `file_path`;
+        // it is a mutating tool and must appear in RECENT FILES.
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"NotebookEdit","input":{"notebook_path":"/abs/notes/analysis.ipynb"}}]},"timestamp":"2026-05-14T17:32:14.000Z"}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.edited_file_paths,
+            vec!["/abs/notes/analysis.ipynb".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_assistant_skips_read_paths() {
         // Read never modifies the worktree — its file_path should not
         // be captured as a recent edit (otherwise the dashboard detail
@@ -1817,6 +1831,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_current_action_uses_last_action_not_last_tool() {
+        // A message with an action tool (Bash) followed by a read-only tool
+        // (Read) must still surface the Bash command — the live-edge label
+        // tracks the last *action*, not the last tool_use overall.
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/abs/x.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
     fn clean_recap_real_hibiscus_turn_2() {
         // Regression: insight banner + bullets + closing banner + prose.
         let s = "`★ Insight ─────`\n- DetailContext is a borrowed snapshot — zero allocations per draw.\n- The four current modules each tap a different layer.\n`─────`\n\nHere are ideas grouped by layer.";
@@ -1829,8 +1853,8 @@ mod tests {
 
     #[test]
     fn tail_session_takes_latest_context_tokens_and_question_topic() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("sessionx_tail_latest_ctx.jsonl");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
         let l1 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":9},"content":[{"type":"tool_use","id":"t0","name":"Bash","input":{"command":"cargo build"}}]}}"#;
         let l2 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:01.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":98},"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"header":"Auth method"}]}}]}}"#;
         std::fs::write(&path, format!("{l1}\n{l2}\n")).unwrap();
@@ -1843,7 +1867,6 @@ mod tests {
         // l1 set current_action; l2 (AskUserQuestion) leaves it None, so the
         // l1 value must survive (None never overwrites a prior Some).
         assert_eq!(update.current_action.as_deref(), Some("cargo build"));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

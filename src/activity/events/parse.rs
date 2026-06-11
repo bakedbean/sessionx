@@ -201,6 +201,11 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
     let mut last_text: Option<&str> = None;
     let mut longest_text: Option<&str> = None;
     let mut last_tool: Option<(&str, &serde_json::Value)> = None;
+    // The last tool_use that is itself an *action* (Bash or a file mutation),
+    // used for `current_action`. Distinct from `last_tool`: a message that
+    // ends on a read-only tool (e.g. Bash then Read) should still surface the
+    // Bash command as the live edge rather than dropping the label.
+    let mut last_action_tool: Option<(&str, &serde_json::Value)> = None;
     // Subagent dispatches (the `Agent` tool) — collected across the whole
     // message so parallel dispatches can be counted and summarized by type.
     let mut agent_subtypes: Vec<&str> = Vec::new();
@@ -225,6 +230,12 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let input = block.get("input").unwrap_or(&serde_json::Value::Null);
                 last_tool = Some((name, input));
+                if matches!(
+                    name,
+                    "Bash" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit"
+                ) {
+                    last_action_tool = Some((name, input));
+                }
                 if name == "Agent" {
                     agent_subtypes.push(
                         input
@@ -257,7 +268,10 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                 // RECENT FILES list (they'd render without a diff count
                 // and confuse the user).
                 if matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit")
-                    && let Some(p) = input.get("file_path").and_then(|p| p.as_str())
+                    && let Some(p) = input
+                        .get("file_path")
+                        .or_else(|| input.get("notebook_path"))
+                        .and_then(|p| p.as_str())
                 {
                     out.edited_file_paths.push(p.to_string());
                 }
@@ -274,19 +288,22 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
     if let Some(t) = longest_text {
         out.longest_text_in_message = Some(t.to_string());
     }
-    if let Some((name, input)) = last_tool {
+    if let Some((name, input)) = last_action_tool {
         out.current_action = match name {
             "Bash" => input
                 .get("command")
                 .and_then(|c| c.as_str())
                 .map(collapse_ws),
-            "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => input
+            // `last_action_tool` only ever holds Bash or a file mutation, so
+            // this arm covers Edit/MultiEdit/Write/NotebookEdit.
+            _ => input
                 .get("file_path")
                 .or_else(|| input.get("notebook_path"))
                 .and_then(|p| p.as_str())
                 .map(|p| format!("now {}", file_basename(p))),
-            _ => None,
         };
+    }
+    if let Some((name, input)) = last_tool {
         let body = if name == "Bash" {
             let cmd = input
                 .get("command")
