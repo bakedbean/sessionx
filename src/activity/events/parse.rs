@@ -52,6 +52,14 @@ pub struct ParsedLine {
     /// `message.model` from this assistant line, used downstream to map
     /// to a context-window size. None when absent.
     pub model_id: Option<String>,
+    /// A clean, render-ready label for the tool action on this line:
+    /// the Bash command, or `now <basename>` for a file mutation. None
+    /// for read-only / non-action tools and non-assistant lines.
+    pub current_action: Option<String>,
+    /// The question topic for an `AskUserQuestion` tool_use on this line
+    /// (`questions[0].header`, falling back to `questions[0].question`).
+    /// None when no such tool is present.
+    pub pending_question_text: Option<String>,
 }
 
 /// Parse a single JSONL line into a [`ParsedLine`]. Malformed lines and
@@ -145,6 +153,15 @@ fn format_agent_dispatch(subtypes: &[&str]) -> String {
     }
 }
 
+/// Last path component of `p`, as an owned `String`. Falls back to the
+/// whole string when there is no file component.
+fn file_basename(p: &str) -> String {
+    std::path::Path::new(p)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string())
+}
+
 fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
     let mut out = ParsedLine::default();
     // stop_reason lives at message.stop_reason. Some lines (e.g. partial
@@ -216,6 +233,18 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                             .unwrap_or(""),
                     );
                 }
+                if name == "AskUserQuestion" {
+                    out.pending_question_text = input
+                        .get("questions")
+                        .and_then(|q| q.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|q0| {
+                            q0.get("header")
+                                .and_then(|h| h.as_str())
+                                .or_else(|| q0.get("question").and_then(|q| q.as_str()))
+                        })
+                        .map(collapse_ws);
+                }
                 // Track every tool_use we see — multiple in one message is rare
                 // but possible. The id is required for matching tool_results.
                 if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
@@ -246,6 +275,17 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
         out.longest_text_in_message = Some(t.to_string());
     }
     if let Some((name, input)) = last_tool {
+        out.current_action = match name {
+            "Bash" => input
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(collapse_ws),
+            "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => input
+                .get("file_path")
+                .and_then(|p| p.as_str())
+                .map(|p| format!("now {}", file_basename(p))),
+            _ => None,
+        };
         let body = if name == "Bash" {
             let cmd = input
                 .get("command")

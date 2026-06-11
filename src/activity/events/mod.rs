@@ -1716,6 +1716,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_current_action_is_bash_command() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test --lib"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("cargo test --lib"));
+    }
+
+    #[test]
+    fn parse_assistant_current_action_is_now_basename_for_edit() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/abs/src/ui/dashboard/column_content.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.current_action.as_deref(),
+            Some("now column_content.rs")
+        );
+    }
+
+    #[test]
+    fn parse_assistant_no_current_action_for_read() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/abs/x.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action, None);
+    }
+
+    #[test]
+    fn parse_assistant_captures_ask_user_question_header() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"header":"Auth method","question":"Which auth approach?"}]}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.pending_question_text.as_deref(), Some("Auth method"));
+    }
+
+    #[test]
+    fn parse_assistant_ask_user_question_falls_back_to_question() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Which auth approach?"}]}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.pending_question_text.as_deref(),
+            Some("Which auth approach?")
+        );
+    }
+
+    #[test]
     fn clean_recap_real_hibiscus_turn_2() {
         // Regression: insight banner + bullets + closing banner + prose.
         let s = "`★ Insight ─────`\n- DetailContext is a borrowed snapshot — zero allocations per draw.\n- The four current modules each tap a different layer.\n`─────`\n\nHere are ideas grouped by layer.";
