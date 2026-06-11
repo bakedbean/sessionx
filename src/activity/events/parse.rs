@@ -282,6 +282,7 @@ fn parse_assistant(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                 .map(collapse_ws),
             "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => input
                 .get("file_path")
+                .or_else(|| input.get("notebook_path"))
                 .and_then(|p| p.as_str())
                 .map(|p| format!("now {}", file_basename(p))),
             _ => None,

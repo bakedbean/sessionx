@@ -1757,6 +1757,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_current_action_for_notebook_edit_uses_notebook_path() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"NotebookEdit","input":{"notebook_path":"/abs/notes/analysis.ipynb"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("now analysis.ipynb"));
+    }
+
+    #[test]
+    fn parse_assistant_current_action_for_write_uses_file_path() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"/abs/src/new_mod.rs"}}]}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.current_action.as_deref(), Some("now new_mod.rs"));
+    }
+
+    #[test]
     fn clean_recap_real_hibiscus_turn_2() {
         // Regression: insight banner + bullets + closing banner + prose.
         let s = "`★ Insight ─────`\n- DetailContext is a borrowed snapshot — zero allocations per draw.\n- The four current modules each tap a different layer.\n`─────`\n\nHere are ideas grouped by layer.";
