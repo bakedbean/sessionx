@@ -202,6 +202,21 @@ pub struct WorkspaceEvents {
     /// the SESSION SUMMARY column has stable text to render between
     /// turns. Cleared on session reset.
     pub last_completed_turn_text: Option<String>,
+    /// Latest assistant message's context-window fill (input + cache
+    /// creation + cache read). Drives the detail bar's context line.
+    /// Cleared on session reset.
+    pub context_tokens: Option<u64>,
+    /// Latest assistant message's model id, for context-window sizing.
+    /// Cleared on session reset.
+    pub model_id: Option<String>,
+    /// Render-ready label for the agent's most recent tool action
+    /// (Bash command or `now <basename>`). Drives the row's live edge
+    /// in Thinking/Waiting. Cleared on session reset.
+    pub current_action: Option<String>,
+    /// Topic of the pending `AskUserQuestion`, if one is in flight.
+    /// Drives the row's `asking: <topic>` in the Question state.
+    /// Cleared on session reset and when no question tool is pending.
+    pub pending_question_text: Option<String>,
 }
 
 impl Default for WorkspaceEvents {
@@ -222,6 +237,10 @@ impl Default for WorkspaceEvents {
             recent_edited_files: VecDeque::with_capacity(7),
             longest_text_this_turn: None,
             last_completed_turn_text: None,
+            context_tokens: None,
+            model_id: None,
+            current_action: None,
+            pending_question_text: None,
         }
     }
 }
@@ -253,6 +272,10 @@ impl WorkspaceEvents {
         self.recent_edited_files.clear();
         self.longest_text_this_turn = None;
         self.last_completed_turn_text = None;
+        self.context_tokens = None;
+        self.model_id = None;
+        self.current_action = None;
+        self.pending_question_text = None;
     }
 
     /// Merge a batch's longest assistant text into the per-turn
@@ -1821,5 +1844,21 @@ mod tests {
         // l1 value must survive (None never overwrites a prior Some).
         assert_eq!(update.current_action.as_deref(), Some("cargo build"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reset_clears_new_activity_fields() {
+        let mut e = WorkspaceEvents {
+            context_tokens: Some(123),
+            model_id: Some("claude-opus-4-8".to_string()),
+            current_action: Some("now x.rs".to_string()),
+            pending_question_text: Some("Auth method".to_string()),
+            ..WorkspaceEvents::default()
+        };
+        e.reset_session_state();
+        assert_eq!(e.context_tokens, None);
+        assert_eq!(e.model_id, None);
+        assert_eq!(e.current_action, None);
+        assert_eq!(e.pending_question_text, None);
     }
 }
