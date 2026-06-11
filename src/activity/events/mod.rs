@@ -534,6 +534,8 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
         if let Some(a) = parsed.current_action {
             update.current_action = Some(a);
         }
+        // Last-wins is fine: only one AskUserQuestion can be outstanding at
+        // a time, so a batch realistically carries at most one.
         if let Some(q) = parsed.pending_question_text {
             update.pending_question_text = Some(q);
         }
@@ -1806,7 +1808,7 @@ mod tests {
     fn tail_session_takes_latest_context_tokens_and_question_topic() {
         let dir = std::env::temp_dir();
         let path = dir.join("sessionx_tail_latest_ctx.jsonl");
-        let l1 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":9},"content":[{"type":"text","text":"a"}]}}"#;
+        let l1 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":9},"content":[{"type":"tool_use","id":"t0","name":"Bash","input":{"command":"cargo build"}}]}}"#;
         let l2 = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:01.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":98},"content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"header":"Auth method"}]}}]}}"#;
         std::fs::write(&path, format!("{l1}\n{l2}\n")).unwrap();
 
@@ -1815,6 +1817,9 @@ mod tests {
         assert_eq!(update.context_tokens, Some(100));
         assert_eq!(update.model_id.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(update.pending_question_text.as_deref(), Some("Auth method"));
+        // l1 set current_action; l2 (AskUserQuestion) leaves it None, so the
+        // l1 value must survive (None never overwrites a prior Some).
+        assert_eq!(update.current_action.as_deref(), Some("cargo build"));
         let _ = std::fs::remove_file(&path);
     }
 }
