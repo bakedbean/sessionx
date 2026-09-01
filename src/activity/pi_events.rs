@@ -137,6 +137,11 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
             update.human_replied_after_last_stop = true;
             update.last_user_interrupted = Some(false);
         }
+        if update.first_user_text.is_none()
+            && let Some(t) = parsed.first_user_text
+        {
+            update.first_user_text = Some(t);
+        }
         // Track batch-longest from each message's longest-in-message
         // (NOT its last text). See events.rs for rationale.
         if let Some(longest) = parsed.longest_text_in_message {
@@ -170,6 +175,11 @@ pub struct ParsedLine {
     /// Longest `text` content block (by char count) in this message.
     /// See `crate::activity::events::ParsedLine::longest_text_in_message`.
     pub longest_text_in_message: Option<String>,
+    /// Plain user text content when this line is a user message (None
+    /// otherwise). Aggregated into `TailUpdate.first_user_text` upstream,
+    /// mirroring the Claude parser — the status classifier's
+    /// `user_has_prompted` gate reads it.
+    pub first_user_text: Option<String>,
 }
 
 /// Parse a single pi session JSONL line into a [`ParsedLine`].
@@ -252,6 +262,7 @@ fn parse_pi_user(msg: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
                     timestamp_ms,
                 });
                 out.is_user_text = true;
+                out.first_user_text = Some(t.to_string());
             }
             return out;
         }
@@ -281,6 +292,7 @@ fn parse_pi_user(msg: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
         timestamp_ms,
     });
     out.is_user_text = true;
+    out.first_user_text = Some(trimmed.to_string());
     out
 }
 
@@ -473,6 +485,30 @@ mod tests {
         assert_eq!(ev.kind, EventKind::UserMessage);
         assert!(parsed.is_user_text);
         assert!(ev.display.starts_with("user: how do I add"));
+    }
+
+    /// The classifier's `user_has_prompted` gate reads
+    /// `WorkspaceEvents.first_user_text`; without this field a running
+    /// pi/omp session classifies as Idle forever, whatever the PTY does.
+    #[test]
+    fn user_line_carries_first_user_text() {
+        let line = r#"{"type":"message","id":"u1","parentId":"p1","timestamp":"2026-05-22T18:44:22.032Z","message":{"role":"user","content":[{"type":"text","text":"how do I add a new migration?"}],"timestamp":1779475462031}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.first_user_text.as_deref(),
+            Some("how do I add a new migration?")
+        );
+    }
+
+    #[test]
+    fn tail_session_keeps_the_first_user_text_of_the_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let first = r#"{"type":"message","id":"u1","parentId":"p1","timestamp":"2026-05-22T18:44:22.032Z","message":{"role":"user","content":[{"type":"text","text":"fix the login bug"}],"timestamp":1779475462031}}"#;
+        let second = r#"{"type":"message","id":"u2","parentId":"u1","timestamp":"2026-05-22T18:44:30.000Z","message":{"role":"user","content":[{"type":"text","text":"also add a test"}],"timestamp":1779475470000}}"#;
+        std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+        let update = tail_session(&path, 0).unwrap();
+        assert_eq!(update.first_user_text.as_deref(), Some("fix the login bug"));
     }
 
     #[test]
