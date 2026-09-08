@@ -158,6 +158,12 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
         if let Some(text) = parsed.last_assistant_text {
             update.last_assistant_text = Some(text);
         }
+        if let Some(t) = parsed.context_tokens {
+            update.context_tokens = Some(t);
+        }
+        if let Some(m) = parsed.model_id {
+            update.model_id = Some(m);
+        }
     }
     update.new_offset = consumed;
     Ok(update)
@@ -180,6 +186,14 @@ pub struct ParsedLine {
     /// mirroring the Claude parser — the status classifier's
     /// `user_has_prompted` gate reads it.
     pub first_user_text: Option<String>,
+    /// Context-window fill for this assistant message: pi's
+    /// `usage.input + usage.cacheRead + usage.cacheWrite` (the prompt
+    /// size, excluding output). None when the line carries no usage.
+    pub context_tokens: Option<u64>,
+    /// `message.model` on an assistant line, e.g. `gpt-5.6-sol`. The
+    /// provider prefix seen on `model_change` entries is not included,
+    /// matching the bare id the Claude parser reports.
+    pub model_id: Option<String>,
 }
 
 /// Parse a single pi session JSONL line into a [`ParsedLine`].
@@ -302,6 +316,16 @@ fn parse_pi_assistant(msg: &serde_json::Value, timestamp_ms: i64) -> ParsedLine 
     // Parse stopReason.
     if let Some(sr) = msg.get("stopReason").and_then(|s| s.as_str()) {
         out.stop_reason = Some(map_pi_stop_reason(sr));
+    }
+    // Model and usage sit beside `content`, so read them before the
+    // content early-return below: a message with no content blocks still
+    // reports what model produced it and how full the context is.
+    if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
+        out.model_id = Some(model.to_string());
+    }
+    if let Some(usage) = msg.get("usage") {
+        let field = |k: &str| usage.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        out.context_tokens = Some(field("input") + field("cacheRead") + field("cacheWrite"));
     }
 
     let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
