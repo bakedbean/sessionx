@@ -535,6 +535,39 @@ mod tests {
     }
 
     #[test]
+    fn assistant_line_carries_model_and_context_tokens() {
+        // usage shape is pi's: input + cacheRead + cacheWrite is the prompt
+        // size (context fill); output and totalTokens are excluded.
+        let line = r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-22T18:44:23.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"stopReason":"stop","api":"openai-codex-responses","provider":"openai-codex","model":"gpt-5.6-sol","usage":{"input":1273,"output":85,"cacheRead":15104,"cacheWrite":23,"totalTokens":16462},"timestamp":1779475463000}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.model_id.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(parsed.context_tokens, Some(1273 + 15104 + 23));
+    }
+
+    #[test]
+    fn assistant_line_without_usage_or_model_yields_none() {
+        let line = r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-22T18:44:23.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"stopReason":"stop"}}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.model_id, None);
+        assert_eq!(parsed.context_tokens, None);
+    }
+
+    #[test]
+    fn tail_session_takes_latest_model_and_context_tokens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let l1 = r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-22T18:44:23.000Z","message":{"role":"assistant","content":[{"type":"text","text":"one"}],"stopReason":"stop","provider":"deepseek","model":"deepseek-v4-pro","usage":{"input":1,"output":5,"cacheRead":9,"cacheWrite":0}}}"#;
+        let l2 = r#"{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-05-22T18:44:24.000Z","message":{"role":"assistant","content":[{"type":"text","text":"two"}],"stopReason":"stop","provider":"openai-codex","model":"gpt-5.6-sol","usage":{"input":2,"output":5,"cacheRead":98,"cacheWrite":0}}}"#;
+        // A trailing line with no usage/model must not clobber the last value.
+        let l3 = r#"{"type":"message","id":"a3","parentId":"a2","timestamp":"2026-05-22T18:44:25.000Z","message":{"role":"assistant","content":[{"type":"text","text":"three"}],"stopReason":"stop"}}"#;
+        std::fs::write(&path, format!("{l1}\n{l2}\n{l3}\n")).unwrap();
+
+        let update = tail_session(&path, 0).unwrap();
+        assert_eq!(update.context_tokens, Some(100));
+        assert_eq!(update.model_id.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
     fn parses_assistant_tool_call() {
         let line = r#"{"type":"message","id":"a2","parentId":"u2","timestamp":"2026-05-22T18:44:24.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_001","name":"bash","arguments":{"command":"cargo test --workspace"}}],"stopReason":"toolUse","api":"openai-completions","provider":"deepseek","model":"deepseek-v4-pro","usage":{"input":100,"output":50},"timestamp":1779475464000}}"#;
         let parsed = parse_jsonl_line(line);
