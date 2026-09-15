@@ -32,6 +32,15 @@ pub struct ParsedLine {
     pub first_user_text: Option<String>,
     pub last_assistant_text: Option<String>,
     pub longest_text_in_message: Option<String>,
+    /// `payload.model` from a `turn_context` line (e.g. `gpt-6-astra`).
+    pub model_id: Option<String>,
+    /// Prompt-side size of the last request, from
+    /// `token_count.info.last_token_usage.input_tokens`. Codex counts cached
+    /// tokens inside `input_tokens`, so no summing as in the pi parser.
+    pub context_tokens: Option<u64>,
+    /// `token_count.info.model_context_window`, the window codex is sizing
+    /// its own compaction against.
+    pub context_window: Option<u64>,
 }
 
 /// Parse one Codex rollout line. Codex emits two parallel streams; we map a
@@ -41,8 +50,10 @@ pub struct ParsedLine {
 ///   event_msg/task_complete  -> end_turn + recap text (no separate event)
 ///   response_item/function_call         -> tool start
 ///   response_item/function_call_output  -> tool resolve
-/// Everything else (response_item/message, reasoning, token_count,
-/// session_meta, turn_context, task_started) is ignored.
+///   turn_context                        -> model_id (no event)
+///   event_msg/token_count               -> context_tokens + context_window (no event)
+/// Everything else (response_item/message, reasoning, session_meta,
+/// task_started) is ignored.
 pub fn parse_jsonl_line(line: &str) -> ParsedLine {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return ParsedLine::default();
@@ -66,6 +77,8 @@ pub fn parse_jsonl_line(line: &str) -> ParsedLine {
         ("event_msg", "task_complete") => parse_task_complete(payload),
         ("response_item", "function_call") => parse_function_call(payload, ts),
         ("response_item", "function_call_output") => parse_function_call_output(payload),
+        ("turn_context", _) => parse_turn_context(payload),
+        ("event_msg", "token_count") => parse_token_count(payload),
         _ => ParsedLine::default(),
     }
 }
@@ -183,6 +196,37 @@ fn parse_function_call_output(payload: &serde_json::Value) -> ParsedLine {
     };
     ParsedLine {
         tool_use_resolves,
+        ..ParsedLine::default()
+    }
+}
+
+fn parse_turn_context(payload: &serde_json::Value) -> ParsedLine {
+    ParsedLine {
+        model_id: payload
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        ..ParsedLine::default()
+    }
+}
+
+fn parse_token_count(payload: &serde_json::Value) -> ParsedLine {
+    // `info` is null until the first model response lands; leave both
+    // fields None so a stale null line can't clobber earlier real values.
+    let Some(info) = payload.get("info").filter(|i| !i.is_null()) else {
+        return ParsedLine::default();
+    };
+    ParsedLine {
+        context_tokens: info
+            .get("last_token_usage")
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(|n| n.as_u64()),
+        // A zero window is meaningless; drop it so downstream never divides
+        // by it when computing fill percentage.
+        context_window: info
+            .get("model_context_window")
+            .and_then(|n| n.as_u64())
+            .filter(|w| *w > 0),
         ..ParsedLine::default()
     }
 }
@@ -320,6 +364,15 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
         }
         if let Some(text) = parsed.last_assistant_text {
             update.last_assistant_text = Some(text);
+        }
+        if let Some(m) = parsed.model_id {
+            update.model_id = Some(m);
+        }
+        if let Some(t) = parsed.context_tokens {
+            update.context_tokens = Some(t);
+        }
+        if let Some(w) = parsed.context_window {
+            update.context_window = Some(w);
         }
     }
     update.new_offset = consumed;
@@ -522,5 +575,151 @@ mod tests {
             l1.len() + 1,
             "offset stops after the terminated line"
         );
+    }
+
+    #[test]
+    fn turn_context_carries_model_id_without_display_event() {
+        // Trimmed from a real rollout: the payload also carries cwd,
+        // sandbox_policy, collaboration_mode, etc. — only `model` matters.
+        let line = r#"{"timestamp":"2026-09-15T19:24:15.105Z","ordinal":7,"type":"turn_context","payload":{"turn_id":"t1","cwd":"/x","approval_policy":"never","model":"gpt-6-astra","comp_hash":"3000","collaboration_mode":{"mode":"default","settings":{"model":"gpt-6-astra","reasoning_effort":null}}}}"#;
+        let p = parse_jsonl_line(line);
+        assert_eq!(p.model_id.as_deref(), Some("gpt-6-astra"));
+        assert!(
+            p.event.is_none(),
+            "turn_context is bookkeeping, not a log line"
+        );
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, None);
+    }
+
+    #[test]
+    fn token_count_carries_context_tokens_and_window() {
+        // `input_tokens` is the full prompt side of the last request (cached
+        // tokens are a subset of it, not additive as in pi's usage shape).
+        let line = r#"{"timestamp":"2026-09-15T19:27:59.213Z","ordinal":114,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":905409,"cached_input_tokens":834432,"cache_write_input_tokens":0,"output_tokens":5425,"reasoning_output_tokens":339,"total_tokens":910834},"last_token_usage":{"input_tokens":80645,"cached_input_tokens":80000,"cache_write_input_tokens":0,"output_tokens":42,"reasoning_output_tokens":0,"total_tokens":80687},"model_context_window":258400},"rate_limits":{"limit_id":"codex"}}}"#;
+        let p = parse_jsonl_line(line);
+        assert_eq!(p.context_tokens, Some(80_645));
+        assert_eq!(p.context_window, Some(258_400));
+        assert!(
+            p.event.is_none(),
+            "token_count is bookkeeping, not a log line"
+        );
+        assert_eq!(p.model_id, None);
+    }
+
+    #[test]
+    fn token_count_with_null_info_sets_nothing() {
+        // Codex emits `info: null` before the first model response.
+        let line = r#"{"timestamp":"2026-09-15T19:24:15.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}"#;
+        let p = parse_jsonl_line(line);
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, None);
+        assert!(p.event.is_none());
+    }
+
+    #[test]
+    fn tail_session_takes_latest_model_context_tokens_and_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x.jsonl");
+        let l1 = r#"{"timestamp":"2026-09-15T19:24:15.105Z","type":"turn_context","payload":{"model":"gpt-6-astra"}}"#;
+        let l2 = r#"{"timestamp":"2026-09-15T19:24:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"model_context_window":258400}}}"#;
+        let l3 = r#"{"timestamp":"2026-09-15T19:25:15.105Z","type":"turn_context","payload":{"model":"gpt-6-mini"}}"#;
+        let l4 = r#"{"timestamp":"2026-09-15T19:25:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":74000},"model_context_window":128000}}}"#;
+        // A trailing null-info token_count must not clobber the last real values.
+        let l5 = r#"{"timestamp":"2026-09-15T19:25:21.000Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#;
+        std::fs::write(&path, format!("{l1}\n{l2}\n{l3}\n{l4}\n{l5}\n")).unwrap();
+        let u = tail_session(&path, 0).unwrap();
+        assert_eq!(u.model_id.as_deref(), Some("gpt-6-mini"));
+        assert_eq!(u.context_tokens, Some(74_000));
+        assert_eq!(u.context_window, Some(128_000));
+        assert!(u.events.is_empty(), "none of these lines render");
+    }
+
+    #[test]
+    fn token_count_with_partial_or_mistyped_info_sets_only_what_parses() {
+        // No last_token_usage: window still parses, tokens stay None.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":258400}}}"#,
+        );
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, Some(258_400));
+
+        // Wrong types (string / negative) are rejected field-by-field.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":"80645"},"model_context_window":-1}}}"#,
+        );
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, None);
+
+        // last_token_usage present but input_tokens missing.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":42}}}}"#,
+        );
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, None);
+    }
+
+    #[test]
+    fn turn_context_without_model_sets_nothing() {
+        let p = parse_jsonl_line(r#"{"type":"turn_context","payload":{"cwd":"/x"}}"#);
+        assert_eq!(p.model_id, None);
+        let p = parse_jsonl_line(r#"{"type":"turn_context","payload":{"model":42}}"#);
+        assert_eq!(p.model_id, None);
+    }
+
+    #[test]
+    fn tail_session_model_change_without_usage_keeps_last_known_tokens() {
+        // Fields are independent last-known values: a mid-session model
+        // switch (turn_context) with no token_count after it must update
+        // model_id while leaving context_tokens/context_window intact.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x.jsonl");
+        let l1 = r#"{"type":"turn_context","payload":{"model":"gpt-6-astra"}}"#;
+        let l2 = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":74000},"model_context_window":258400}}}"#;
+        let l3 = r#"{"type":"turn_context","payload":{"model":"gpt-6-mini"}}"#;
+        std::fs::write(&path, format!("{l1}\n{l2}\n{l3}\n")).unwrap();
+        let u = tail_session(&path, 0).unwrap();
+        assert_eq!(u.model_id.as_deref(), Some("gpt-6-mini"));
+        assert_eq!(u.context_tokens, Some(74_000));
+        assert_eq!(u.context_window, Some(258_400));
+    }
+
+    #[test]
+    fn token_count_with_zero_window_reports_no_window() {
+        // A zero-size window is meaningless and would invite a downstream
+        // divide-by-zero in the fill percentage; treat it as absent.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"model_context_window":0}}}"#,
+        );
+        assert_eq!(p.context_tokens, Some(100));
+        assert_eq!(p.context_window, None);
+    }
+
+    #[test]
+    fn tail_session_metadata_split_across_incremental_batches() {
+        // Each batch reports only what it saw; None means "nothing new",
+        // and the downstream merge keeps its previous value. So a batch
+        // holding just a turn_context yields model_id alone, and a later
+        // batch holding just a token_count yields tokens/window alone.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x.jsonl");
+        let l1 = r#"{"type":"turn_context","payload":{"model":"gpt-6-astra"}}"#;
+        std::fs::write(&path, format!("{l1}\n")).unwrap();
+        let u1 = tail_session(&path, 0).unwrap();
+        assert_eq!(u1.model_id.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(u1.context_tokens, None);
+        assert_eq!(u1.context_window, None);
+
+        let l2 = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":74000},"model_context_window":258400}}}"#;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(f, "{l2}").unwrap();
+        let u2 = tail_session(&path, u1.new_offset).unwrap();
+        assert_eq!(u2.model_id, None, "no model line in this batch");
+        assert_eq!(u2.context_tokens, Some(74_000));
+        assert_eq!(u2.context_window, Some(258_400));
     }
 }
