@@ -444,6 +444,10 @@ pub struct TailUpdate {
     pub context_tokens: Option<u64>,
     /// Model id from the last assistant message in this batch.
     pub model_id: Option<String>,
+    /// `identity.modelId` from the last model attachment in this batch
+    /// (e.g. `claude-opus-5[1m]`). Carries the context-window variant tag
+    /// that `model_id` lacks. None when no model attachment was seen.
+    pub model_variant_id: Option<String>,
     /// Render-ready label for the most recent tool action in this batch.
     pub current_action: Option<String>,
     /// AskUserQuestion topic from the last such tool_use in this batch.
@@ -555,6 +559,9 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
         }
         if let Some(m) = parsed.model_id {
             update.model_id = Some(m);
+        }
+        if let Some(m) = parsed.model_variant_id {
+            update.model_variant_id = Some(m);
         }
         if let Some(a) = parsed.current_action {
             update.current_action = Some(a);
@@ -1888,6 +1895,31 @@ mod tests {
         // l1 set current_action; l2 (AskUserQuestion) leaves it None, so the
         // l1 value must survive (None never overwrites a prior Some).
         assert_eq!(update.current_action.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
+    fn tail_session_forwards_model_variant_id_and_keeps_model_id_separate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let att = r#"{"attachment":{"type":"model","identity":{"modelId":"claude-opus-5[1m]","marketingName":"Opus 5 (1M context)","knowledgeCutoff":"May 2026"},"text":"x"},"type":"attachment","timestamp":"2026-09-15T13:11:57.747Z"}"#;
+        let asst = r#"{"type":"assistant","timestamp":"2026-09-15T13:12:00.000Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":9},"content":[{"type":"text","text":"hi"}]}}"#;
+        std::fs::write(&path, format!("{att}\n{asst}\n")).unwrap();
+
+        let update = tail_session(&path, 0).unwrap();
+        assert_eq!(update.model_variant_id.as_deref(), Some("claude-opus-5[1m]"));
+        assert_eq!(update.model_id.as_deref(), Some("claude-opus-5"));
+        // The attachment contributes no display event.
+        assert_eq!(update.events.len(), 1);
+    }
+
+    #[test]
+    fn tail_session_model_variant_id_is_none_without_attachment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let asst = r#"{"type":"assistant","timestamp":"2026-09-15T13:12:00.000Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"hi"}]}}"#;
+        std::fs::write(&path, format!("{asst}\n")).unwrap();
+        let update = tail_session(&path, 0).unwrap();
+        assert_eq!(update.model_variant_id, None);
     }
 
     #[test]
