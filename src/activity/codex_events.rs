@@ -221,7 +221,12 @@ fn parse_token_count(payload: &serde_json::Value) -> ParsedLine {
             .get("last_token_usage")
             .and_then(|u| u.get("input_tokens"))
             .and_then(|n| n.as_u64()),
-        context_window: info.get("model_context_window").and_then(|n| n.as_u64()),
+        // A zero window is meaningless; drop it so downstream never divides
+        // by it when computing fill percentage.
+        context_window: info
+            .get("model_context_window")
+            .and_then(|n| n.as_u64())
+            .filter(|w| *w > 0),
         ..ParsedLine::default()
     }
 }
@@ -677,5 +682,44 @@ mod tests {
         assert_eq!(u.model_id.as_deref(), Some("gpt-6-mini"));
         assert_eq!(u.context_tokens, Some(74_000));
         assert_eq!(u.context_window, Some(258_400));
+    }
+
+    #[test]
+    fn token_count_with_zero_window_reports_no_window() {
+        // A zero-size window is meaningless and would invite a downstream
+        // divide-by-zero in the fill percentage; treat it as absent.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"model_context_window":0}}}"#,
+        );
+        assert_eq!(p.context_tokens, Some(100));
+        assert_eq!(p.context_window, None);
+    }
+
+    #[test]
+    fn tail_session_metadata_split_across_incremental_batches() {
+        // Each batch reports only what it saw; None means "nothing new",
+        // and the downstream merge keeps its previous value. So a batch
+        // holding just a turn_context yields model_id alone, and a later
+        // batch holding just a token_count yields tokens/window alone.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x.jsonl");
+        let l1 = r#"{"type":"turn_context","payload":{"model":"gpt-6-astra"}}"#;
+        std::fs::write(&path, format!("{l1}\n")).unwrap();
+        let u1 = tail_session(&path, 0).unwrap();
+        assert_eq!(u1.model_id.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(u1.context_tokens, None);
+        assert_eq!(u1.context_window, None);
+
+        let l2 = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":74000},"model_context_window":258400}}}"#;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(f, "{l2}").unwrap();
+        let u2 = tail_session(&path, u1.new_offset).unwrap();
+        assert_eq!(u2.model_id, None, "no model line in this batch");
+        assert_eq!(u2.context_tokens, Some(74_000));
+        assert_eq!(u2.context_window, Some(258_400));
     }
 }
