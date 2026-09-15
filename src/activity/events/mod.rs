@@ -214,6 +214,11 @@ pub struct WorkspaceEvents {
     /// that `model_id` omits. Prefer this over `model_id` for window
     /// sizing when present. Cleared on session reset.
     pub model_variant_id: Option<String>,
+    /// Context-window size in tokens as reported by the agent itself
+    /// (codex's `token_count.info.model_context_window`). Claude Code and
+    /// pi logs carry no such figure, so downstream falls back to a
+    /// model-id lookup when this is None. Cleared on session reset.
+    pub context_window: Option<u64>,
     /// Render-ready label for the agent's most recent tool action
     /// (Bash command or `now <basename>`). Drives the row's live edge
     /// in Thinking/Waiting. Cleared on session reset.
@@ -247,6 +252,7 @@ impl Default for WorkspaceEvents {
             context_tokens: None,
             model_id: None,
             model_variant_id: None,
+            context_window: None,
             current_action: None,
             pending_question_text: None,
         }
@@ -283,6 +289,7 @@ impl WorkspaceEvents {
         self.context_tokens = None;
         self.model_id = None;
         self.model_variant_id = None;
+        self.context_window = None;
         self.current_action = None;
         self.pending_question_text = None;
     }
@@ -455,6 +462,9 @@ pub struct TailUpdate {
     /// (e.g. `claude-opus-5[1m]`). Carries the context-window variant tag
     /// that `model_id` lacks. None when no model attachment was seen.
     pub model_variant_id: Option<String>,
+    /// Agent-reported context-window size from the last line in this
+    /// batch that carried one. Only the codex parser sets it.
+    pub context_window: Option<u64>,
     /// Render-ready label for the most recent tool action in this batch.
     pub current_action: Option<String>,
     /// AskUserQuestion topic from the last such tool_use in this batch.
@@ -1936,11 +1946,19 @@ mod tests {
     }
 
     #[test]
+    fn tail_update_default_has_no_context_window() {
+        // Claude Code logs never report a window size; the field exists for
+        // parsers (codex) that do, and must default to None here.
+        assert_eq!(TailUpdate::default().context_window, None);
+    }
+
+    #[test]
     fn reset_clears_new_activity_fields() {
         let mut e = WorkspaceEvents {
             context_tokens: Some(123),
             model_id: Some("claude-opus-4-8".to_string()),
             model_variant_id: Some("claude-opus-4-8[1m]".to_string()),
+            context_window: Some(258_400),
             current_action: Some("now x.rs".to_string()),
             pending_question_text: Some("Auth method".to_string()),
             ..WorkspaceEvents::default()
@@ -1949,6 +1967,7 @@ mod tests {
         assert_eq!(e.context_tokens, None);
         assert_eq!(e.model_id, None);
         assert_eq!(e.model_variant_id, None);
+        assert_eq!(e.context_window, None);
         assert_eq!(e.current_action, None);
         assert_eq!(e.pending_question_text, None);
     }
