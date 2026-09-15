@@ -1776,6 +1776,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_attachment_surfaces_model_variant_id() {
+        // Verbatim Claude Code record. `message.model` on assistant lines
+        // is the bare `claude-opus-5`; only this attachment carries the
+        // `[1m]` context-window variant.
+        let line = r#"{"parentUuid":"b3a7448f-469f-4198-a3c6-c627e0e78cf4","isSidechain":false,"attachment":{"type":"model","identity":{"modelId":"claude-opus-5[1m]","marketingName":"Opus 5 (1M context)","knowledgeCutoff":"May 2026"},"text":"You are powered by the model named Opus 5 (1M context). The exact model ID is claude-opus-5[1m]. Assistant knowledge cutoff is May 2026."},"type":"attachment","uuid":"0d09e299-929c-4630-8891-d7ec537a7ebc","timestamp":"2026-09-15T13:11:57.747Z","rendered":[{"content":"<system-reminder>\nYou are powered by the model named Opus 5 (1M context). The exact model ID is claude-opus-5[1m]. Assistant knowledge cutoff is May 2026.\n</system-reminder>"}],"userType":"external","entrypoint":"cli","cwd":"/Users/eben/.local/state/wsx/worktrees/ssk-web/brazen-lupin","sessionId":"73b66cd3-891d-4cca-870e-6bd0ebbb498a","version":"2.1.272","gitBranch":"eben/brazen-lupin"}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.model_variant_id.as_deref(), Some("claude-opus-5[1m]"));
+        // Attachments stay out of the display log and never touch model_id.
+        assert!(parsed.event.is_none());
+        assert_eq!(parsed.model_id, None);
+    }
+
+    #[test]
+    fn parse_non_model_attachment_leaves_model_variant_id_none() {
+        let line = r#"{"attachment":{"type":"batching_reminder_sent","text":"x","model":"claude-fable-5-1"},"type":"attachment","timestamp":"2026-09-10T21:55:19.518Z"}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.model_variant_id, None);
+        assert_eq!(parsed.model_id, None);
+    }
+
+    #[test]
     fn parse_assistant_current_action_is_bash_command() {
         let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test --lib"}}]}}"#;
         let parsed = parse_jsonl_line(line);

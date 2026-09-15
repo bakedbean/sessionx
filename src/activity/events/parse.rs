@@ -52,6 +52,13 @@ pub struct ParsedLine {
     /// `message.model` from this assistant line, used downstream to map
     /// to a context-window size. None when absent.
     pub model_id: Option<String>,
+    /// `attachment.identity.modelId` from a `type: "attachment"` line
+    /// whose `attachment.type` is `"model"` — the id as Claude Code
+    /// announces it to the session, including a bracketed variant tag
+    /// like `claude-opus-5[1m]` that `message.model` omits. Distinct
+    /// from `model_id`, which stays the per-message id. None for every
+    /// other line type or attachment kind.
+    pub model_variant_id: Option<String>,
     /// A clean, render-ready label for the tool action on this line:
     /// the Bash command, or `now <basename>` for a file mutation. None
     /// for read-only / non-action tools and non-assistant lines.
@@ -78,8 +85,30 @@ pub fn parse_jsonl_line(line: &str) -> ParsedLine {
     match kind {
         "user" => parse_user(&v, timestamp_ms),
         "assistant" => parse_assistant(&v, timestamp_ms),
+        "attachment" => parse_attachment(&v),
         _ => ParsedLine::default(),
     }
+}
+
+/// Attachments are system-injected context, not conversation, so they
+/// never produce a display event. The only one we read is the model
+/// identity announcement (`attachment.type == "model"`).
+fn parse_attachment(v: &serde_json::Value) -> ParsedLine {
+    let mut out = ParsedLine::default();
+    let Some(att) = v.get("attachment") else {
+        return out;
+    };
+    if att.get("type").and_then(|t| t.as_str()) != Some("model") {
+        return out;
+    }
+    if let Some(id) = att
+        .get("identity")
+        .and_then(|i| i.get("modelId"))
+        .and_then(|m| m.as_str())
+    {
+        out.model_variant_id = Some(id.to_string());
+    }
+    out
 }
 
 fn parse_user(v: &serde_json::Value, timestamp_ms: i64) -> ParsedLine {
