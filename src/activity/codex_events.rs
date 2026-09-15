@@ -629,4 +629,53 @@ mod tests {
         assert_eq!(u.context_window, Some(128_000));
         assert!(u.events.is_empty(), "none of these lines render");
     }
+
+    #[test]
+    fn token_count_with_partial_or_mistyped_info_sets_only_what_parses() {
+        // No last_token_usage: window still parses, tokens stay None.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":258400}}}"#,
+        );
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, Some(258_400));
+
+        // Wrong types (string / negative) are rejected field-by-field.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":"80645"},"model_context_window":-1}}}"#,
+        );
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, None);
+
+        // last_token_usage present but input_tokens missing.
+        let p = parse_jsonl_line(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":42}}}}"#,
+        );
+        assert_eq!(p.context_tokens, None);
+        assert_eq!(p.context_window, None);
+    }
+
+    #[test]
+    fn turn_context_without_model_sets_nothing() {
+        let p = parse_jsonl_line(r#"{"type":"turn_context","payload":{"cwd":"/x"}}"#);
+        assert_eq!(p.model_id, None);
+        let p = parse_jsonl_line(r#"{"type":"turn_context","payload":{"model":42}}"#);
+        assert_eq!(p.model_id, None);
+    }
+
+    #[test]
+    fn tail_session_model_change_without_usage_keeps_last_known_tokens() {
+        // Fields are independent last-known values: a mid-session model
+        // switch (turn_context) with no token_count after it must update
+        // model_id while leaving context_tokens/context_window intact.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x.jsonl");
+        let l1 = r#"{"type":"turn_context","payload":{"model":"gpt-6-astra"}}"#;
+        let l2 = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":74000},"model_context_window":258400}}}"#;
+        let l3 = r#"{"type":"turn_context","payload":{"model":"gpt-6-mini"}}"#;
+        std::fs::write(&path, format!("{l1}\n{l2}\n{l3}\n")).unwrap();
+        let u = tail_session(&path, 0).unwrap();
+        assert_eq!(u.model_id.as_deref(), Some("gpt-6-mini"));
+        assert_eq!(u.context_tokens, Some(74_000));
+        assert_eq!(u.context_window, Some(258_400));
+    }
 }

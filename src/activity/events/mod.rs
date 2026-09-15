@@ -202,12 +202,16 @@ pub struct WorkspaceEvents {
     /// the SESSION SUMMARY column has stable text to render between
     /// turns. Cleared on session reset.
     pub last_completed_turn_text: Option<String>,
-    /// Latest assistant message's context-window fill (input + cache
-    /// creation + cache read). Drives the detail bar's context line.
-    /// Cleared on session reset.
+    /// Latest prompt-side token count, normalized per agent: Claude Code
+    /// and pi sum input + cache creation + cache read from the assistant
+    /// message's usage; codex reads `token_count.last_token_usage
+    /// .input_tokens`, which already includes cached tokens. Drives the
+    /// detail bar's context line. Cleared on session reset.
     pub context_tokens: Option<u64>,
-    /// Latest assistant message's model id, for context-window sizing.
-    /// Cleared on session reset.
+    /// Latest model id, from whichever record announces it (Claude Code
+    /// and pi: the assistant message; codex: `turn_context`). Used for
+    /// context-window sizing when `context_window` is None. Cleared on
+    /// session reset.
     pub model_id: Option<String>,
     /// Model id as announced by Claude Code's model attachment (e.g.
     /// `claude-opus-5[1m]`), including the context-window variant tag
@@ -216,8 +220,11 @@ pub struct WorkspaceEvents {
     pub model_variant_id: Option<String>,
     /// Context-window size in tokens as reported by the agent itself
     /// (codex's `token_count.info.model_context_window`). Claude Code and
-    /// pi logs carry no such figure, so downstream falls back to a
-    /// model-id lookup when this is None. Cleared on session reset.
+    /// pi logs carry no such figure, so downstream prefers this when Some
+    /// and otherwise sizes the window from `model_variant_id`/`model_id`.
+    /// Independent of `context_tokens`/`model_id`: each holds its own
+    /// last-known value, so a model switch with no usage line after it
+    /// updates `model_id` alone. Cleared on session reset.
     pub context_window: Option<u64>,
     /// Render-ready label for the agent's most recent tool action
     /// (Bash command or `now <basename>`). Drives the row's live edge
@@ -453,17 +460,22 @@ pub struct TailUpdate {
     /// `WorkspaceEvents.recent_edited_files`, deduping consecutive
     /// same-path entries and bounding to 7.
     pub edited_file_paths: Vec<String>,
-    /// Context-window fill from the LAST assistant message in this batch
-    /// (later messages overwrite earlier ones). None when no usage seen.
+    /// Prompt-side token count from the LAST usage-bearing line in this
+    /// batch (later lines overwrite earlier ones), normalized per agent as
+    /// described on `WorkspaceEvents::context_tokens`. None when no usage
+    /// seen.
     pub context_tokens: Option<u64>,
-    /// Model id from the last assistant message in this batch.
+    /// Model id from the last model-bearing line in this batch (assistant
+    /// message for Claude Code/pi, `turn_context` for codex).
     pub model_id: Option<String>,
     /// `identity.modelId` from the last model attachment in this batch
     /// (e.g. `claude-opus-5[1m]`). Carries the context-window variant tag
     /// that `model_id` lacks. None when no model attachment was seen.
     pub model_variant_id: Option<String>,
     /// Agent-reported context-window size from the last line in this
-    /// batch that carried one. Only the codex parser sets it.
+    /// batch that carried one. Only the codex parser sets it. Like the
+    /// other fields here, None means "nothing seen this batch", not
+    /// "clear" — the caller keeps its previous value.
     pub context_window: Option<u64>,
     /// Render-ready label for the most recent tool action in this batch.
     pub current_action: Option<String>,
