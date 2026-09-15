@@ -209,6 +209,11 @@ pub struct WorkspaceEvents {
     /// Latest assistant message's model id, for context-window sizing.
     /// Cleared on session reset.
     pub model_id: Option<String>,
+    /// Model id as announced by Claude Code's model attachment (e.g.
+    /// `claude-opus-5[1m]`), including the context-window variant tag
+    /// that `model_id` omits. Prefer this over `model_id` for window
+    /// sizing when present. Cleared on session reset.
+    pub model_variant_id: Option<String>,
     /// Render-ready label for the agent's most recent tool action
     /// (Bash command or `now <basename>`). Drives the row's live edge
     /// in Thinking/Waiting. Cleared on session reset.
@@ -241,6 +246,7 @@ impl Default for WorkspaceEvents {
             last_completed_turn_text: None,
             context_tokens: None,
             model_id: None,
+            model_variant_id: None,
             current_action: None,
             pending_question_text: None,
         }
@@ -276,6 +282,7 @@ impl WorkspaceEvents {
         self.last_completed_turn_text = None;
         self.context_tokens = None;
         self.model_id = None;
+        self.model_variant_id = None;
         self.current_action = None;
         self.pending_question_text = None;
     }
@@ -444,6 +451,10 @@ pub struct TailUpdate {
     pub context_tokens: Option<u64>,
     /// Model id from the last assistant message in this batch.
     pub model_id: Option<String>,
+    /// `identity.modelId` from the last model attachment in this batch
+    /// (e.g. `claude-opus-5[1m]`). Carries the context-window variant tag
+    /// that `model_id` lacks. None when no model attachment was seen.
+    pub model_variant_id: Option<String>,
     /// Render-ready label for the most recent tool action in this batch.
     pub current_action: Option<String>,
     /// AskUserQuestion topic from the last such tool_use in this batch.
@@ -555,6 +566,9 @@ pub fn tail_session(path: &Path, offset: u64) -> Result<TailUpdate> {
         }
         if let Some(m) = parsed.model_id {
             update.model_id = Some(m);
+        }
+        if let Some(m) = parsed.model_variant_id {
+            update.model_variant_id = Some(m);
         }
         if let Some(a) = parsed.current_action {
             update.current_action = Some(a);
@@ -1776,6 +1790,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_attachment_surfaces_model_variant_id() {
+        // Verbatim Claude Code record. `message.model` on assistant lines
+        // is the bare `claude-opus-5`; only this attachment carries the
+        // `[1m]` context-window variant.
+        let line = r#"{"parentUuid":"b3a7448f-469f-4198-a3c6-c627e0e78cf4","isSidechain":false,"attachment":{"type":"model","identity":{"modelId":"claude-opus-5[1m]","marketingName":"Opus 5 (1M context)","knowledgeCutoff":"May 2026"},"text":"You are powered by the model named Opus 5 (1M context). The exact model ID is claude-opus-5[1m]. Assistant knowledge cutoff is May 2026."},"type":"attachment","uuid":"0d09e299-929c-4630-8891-d7ec537a7ebc","timestamp":"2026-09-15T13:11:57.747Z","rendered":[{"content":"<system-reminder>\nYou are powered by the model named Opus 5 (1M context). The exact model ID is claude-opus-5[1m]. Assistant knowledge cutoff is May 2026.\n</system-reminder>"}],"userType":"external","entrypoint":"cli","cwd":"/Users/eben/.local/state/wsx/worktrees/ssk-web/brazen-lupin","sessionId":"73b66cd3-891d-4cca-870e-6bd0ebbb498a","version":"2.1.272","gitBranch":"eben/brazen-lupin"}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(
+            parsed.model_variant_id.as_deref(),
+            Some("claude-opus-5[1m]")
+        );
+        // Attachments stay out of the display log and never touch model_id.
+        assert!(parsed.event.is_none());
+        assert_eq!(parsed.model_id, None);
+    }
+
+    #[test]
+    fn parse_non_model_attachment_leaves_model_variant_id_none() {
+        let line = r#"{"attachment":{"type":"batching_reminder_sent","text":"x","model":"claude-fable-5-1"},"type":"attachment","timestamp":"2026-09-10T21:55:19.518Z"}"#;
+        let parsed = parse_jsonl_line(line);
+        assert_eq!(parsed.model_variant_id, None);
+        assert_eq!(parsed.model_id, None);
+    }
+
+    #[test]
     fn parse_assistant_current_action_is_bash_command() {
         let line = r#"{"type":"assistant","timestamp":"2026-06-11T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test --lib"}}]}}"#;
         let parsed = parse_jsonl_line(line);
@@ -1870,10 +1908,39 @@ mod tests {
     }
 
     #[test]
+    fn tail_session_forwards_model_variant_id_and_keeps_model_id_separate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let att = r#"{"attachment":{"type":"model","identity":{"modelId":"claude-opus-5[1m]","marketingName":"Opus 5 (1M context)","knowledgeCutoff":"May 2026"},"text":"x"},"type":"attachment","timestamp":"2026-09-15T13:11:57.747Z"}"#;
+        let asst = r#"{"type":"assistant","timestamp":"2026-09-15T13:12:00.000Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":9},"content":[{"type":"text","text":"hi"}]}}"#;
+        std::fs::write(&path, format!("{att}\n{asst}\n")).unwrap();
+
+        let update = tail_session(&path, 0).unwrap();
+        assert_eq!(
+            update.model_variant_id.as_deref(),
+            Some("claude-opus-5[1m]")
+        );
+        assert_eq!(update.model_id.as_deref(), Some("claude-opus-5"));
+        // The attachment contributes no display event.
+        assert_eq!(update.events.len(), 1);
+    }
+
+    #[test]
+    fn tail_session_model_variant_id_is_none_without_attachment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let asst = r#"{"type":"assistant","timestamp":"2026-09-15T13:12:00.000Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"hi"}]}}"#;
+        std::fs::write(&path, format!("{asst}\n")).unwrap();
+        let update = tail_session(&path, 0).unwrap();
+        assert_eq!(update.model_variant_id, None);
+    }
+
+    #[test]
     fn reset_clears_new_activity_fields() {
         let mut e = WorkspaceEvents {
             context_tokens: Some(123),
             model_id: Some("claude-opus-4-8".to_string()),
+            model_variant_id: Some("claude-opus-4-8[1m]".to_string()),
             current_action: Some("now x.rs".to_string()),
             pending_question_text: Some("Auth method".to_string()),
             ..WorkspaceEvents::default()
@@ -1881,6 +1948,7 @@ mod tests {
         e.reset_session_state();
         assert_eq!(e.context_tokens, None);
         assert_eq!(e.model_id, None);
+        assert_eq!(e.model_variant_id, None);
         assert_eq!(e.current_action, None);
         assert_eq!(e.pending_question_text, None);
     }
